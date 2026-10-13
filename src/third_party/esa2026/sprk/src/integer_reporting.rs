@@ -1,10 +1,11 @@
-//! Local exact-integer reporting adapter around the upstream f32 SIMD query.
-//! Candidate IDs use the native writer. Gathering, exact membership and writing
-//! the requested output are all performed by the timed caller.
+//! Local exact-integer reporting adapter around the upstream SPRK tree.
+//! The f32 tree selects leaf ranges with a conservative radius. Each leaf block
+//! also stores its original uint32 points, so membership is decided exactly in
+//! integer arithmetic and accepted points are written straight from the leaf.
 use crate::output::IdDist;
 use crate::scalar::IdStorage;
 use crate::simd::{CompressDispatch, LaneCount, PDVec, SupportedLaneCount};
-use crate::tree::Sprk;
+use crate::tree::{LeafRange, Sprk};
 
 /// Conservative envelope for uint32 coordinates normalized by 2^32.
 /// The absolute term covers f32 coordinate rounding; the relative term covers
@@ -18,46 +19,149 @@ pub fn candidate_radius<const D: usize>(radius: f64) -> f32 {
     (squared.sqrt() as f32).next_up()
 }
 
-pub struct IntegerPointSprk {
-    tree: Option<Sprk<2, 8, f32, u32>>,
-    points: Vec<[u32; 2]>,
-    candidates: Vec<usize>,
-}
-impl IntegerPointSprk {
-    pub fn new(points: &[[u32; 2]]) -> Self {
-        let coords: Vec<_> = points.iter().map(|p| p.map(|x| (x as f64 / 4294967296.0) as f32)).collect();
-        Self { tree: if points.is_empty() { None } else { Some(Sprk::new(&coords)) },
-               points: points.to_vec(), candidates: Vec::new() }
-    }
-    fn candidates(&mut self, center: [u32; 2], radius2: u128) {
-        self.candidates.clear();
-        if let Some(tree) = &self.tree {
-            let pos = center.map(|x| (x as f64 / 4294967296.0) as f32);
-            let radius = candidate_radius::<2>((radius2 as f64).sqrt() / 4294967296.0);
-            tree.query_radius(&pos, radius, &mut self.candidates);
-        }
-    }
-    fn contains(point: [u32; 2], center: [u32; 2], radius2: u128) -> bool {
-        let dx = (point[0] as i64 - center[0] as i64).unsigned_abs() as u128;
-        let dy = (point[1] as i64 - center[1] as i64).unsigned_abs() as u128;
-        dx * dx + dy * dy <= radius2
-    }
-    pub fn query_points(&mut self, center: [u32; 2], radius2: u128, out: &mut Vec<[u32; 2]>) {
-        self.candidates(center, radius2);
-        for &id in &self.candidates {
-            let point = self.points[id];
-            if Self::contains(point, center, radius2) { out.push(point); }
-        }
-    }
-    pub fn query_ids(&mut self, center: [u32; 2], radius2: u128, out: &mut Vec<usize>) {
-        self.candidates(center, radius2);
-        for &id in &self.candidates {
-            if Self::contains(self.points[id], center, radius2) { out.push(id); }
-        }
-    }
+const W: usize = 8;
+
+/// The points of one tree block, packed as `x | y << 32` (the `[u32; 2]` layout).
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Block {
+    points: [u64; W],
+    ids: [u32; W],
+    valid: u8,
 }
 
-const W: usize = 8;
+pub struct IntegerPointSprk {
+    tree: Option<Sprk<2, W, f32, u32>>,
+    blocks: Vec<Block>,
+    ranges: Vec<LeafRange>,
+}
+
+#[inline(always)]
+fn pack(p: [u32; 2]) -> u64 { p[0] as u64 | (p[1] as u64) << 32 }
+
+/// Exact membership of a block's points; bit i is set when point i is inside.
+/// Squared distances are below 2^65, so a carry out of the sum means outside.
+#[inline(always)]
+fn inside_mask(block: &Block, cx: u64, cy: u64, radius2: u64) -> u8 {
+    // Autovectorized code rebuilds the mask bit by bit; compare into a mask register instead.
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let p = _mm512_load_epi64(block.points.as_ptr().cast());
+        let (cx, cy) = (_mm512_set1_epi64(cx as i64), _mm512_set1_epi64(cy as i64));
+        let x = _mm512_and_si512(p, _mm512_set1_epi64(0xFFFF_FFFF));
+        let y = _mm512_srli_epi64::<32>(p);
+        let dx = _mm512_sub_epi64(_mm512_max_epu64(x, cx), _mm512_min_epu64(x, cx));
+        let dy = _mm512_sub_epi64(_mm512_max_epu64(y, cy), _mm512_min_epu64(y, cy));
+        let xx = _mm512_mul_epu32(dx, dx);
+        let sum = _mm512_add_epi64(xx, _mm512_mul_epu32(dy, dy));
+        let no_carry = _mm512_mask_cmpge_epu64_mask(block.valid, sum, xx);
+        return _mm512_mask_cmple_epu64_mask(no_carry, sum, _mm512_set1_epi64(radius2 as i64));
+    }
+    #[allow(unreachable_code)]
+    let mut mask = 0u8;
+    for i in 0..W {
+        let p = block.points[i];
+        let dx = (p & 0xFFFF_FFFF).abs_diff(cx);
+        let dy = (p >> 32).abs_diff(cy);
+        let xx = dx * dx;
+        let sum = xx.wrapping_add(dy * dy);
+        mask |= ((sum >= xx) & (sum <= radius2)) as u8 * (1 << i);
+    }
+    mask & block.valid
+}
+
+/// Appends the selected lanes of `src` to `out`, which must have room for W more.
+#[inline(always)]
+unsafe fn compress_store(src: &[u64; W], mask: u8, out: *mut u64) -> usize {
+    #[cfg(target_feature = "avx512f")]
+    unsafe {
+        use std::arch::x86_64::*;
+        // Compress in a register: memory-destination compress is microcoded on Zen 4.
+        let v = _mm512_maskz_compress_epi64(mask, _mm512_load_epi64(src.as_ptr().cast()));
+        _mm512_storeu_si512(out.cast(), v);
+    }
+    #[cfg(not(target_feature = "avx512f"))]
+    {
+        let mut n = 0;
+        for i in 0..W {
+            unsafe { *out.add(n) = src[i] };
+            n += (mask >> i & 1) as usize;
+        }
+    }
+    mask.count_ones() as usize
+}
+
+impl IntegerPointSprk {
+    pub fn new(points: &[[u32; 2]]) -> Self {
+        if points.is_empty() {
+            return Self { tree: None, blocks: Vec::new(), ranges: Vec::new() };
+        }
+        let coords: Vec<_> = points.iter().map(|p| p.map(|x| (x as f64 / 4294967296.0) as f32)).collect();
+        let tree = Sprk::new(&coords);
+        let blocks = tree.positions_sorted.iter().map(|pdvec| {
+            let mut block = Block { points: [0; W], ids: pdvec.ids, valid: 0 };
+            for (i, &id) in pdvec.ids.iter().enumerate() {
+                if id == u32::SENTINEL { continue; }
+                block.points[i] = pack(points[id as usize]);
+                block.valid |= 1 << i;
+            }
+            block
+        }).collect();
+        Self { tree: Some(tree), blocks, ranges: Vec::new() }
+    }
+
+    /// Calls `emit` with each block range the disk may touch, plus the exact predicate.
+    fn scan(&mut self, center: [u32; 2], radius2: u128, mut emit: impl FnMut(&Block, u8)) {
+        let Some(tree) = &self.tree else { return };
+        let pos = center.map(|x| (x as f64 / 4294967296.0) as f32);
+        let radius = candidate_radius::<2>((radius2 as f64).sqrt() / 4294967296.0);
+        self.ranges.clear();
+        tree.collect_ranges(&pos, 0, 0, radius * radius, &mut [0.0; 2], &mut self.ranges);
+        let (cx, cy) = (center[0] as u64, center[1] as u64);
+        if radius2 <= u64::MAX as u128 {
+            for range in &self.ranges {
+                for block in &self.blocks[range.min_i..range.max_i] {
+                    emit(block, inside_mask(block, cx, cy, radius2 as u64));
+                }
+            }
+        } else {
+            // Radius beyond 2^32: rare, use 128-bit arithmetic.
+            for range in &self.ranges {
+                for block in &self.blocks[range.min_i..range.max_i] {
+                    let mut mask = 0u8;
+                    for i in 0..W {
+                        let p = block.points[i];
+                        let dx = (p & 0xFFFF_FFFF).abs_diff(cx) as u128;
+                        let dy = (p >> 32).abs_diff(cy) as u128;
+                        mask |= ((dx * dx + dy * dy <= radius2) as u8) << i;
+                    }
+                    emit(block, mask & block.valid);
+                }
+            }
+        }
+    }
+
+    pub fn query_points(&mut self, center: [u32; 2], radius2: u128, out: &mut Vec<[u32; 2]>) {
+        self.scan(center, radius2, |block, mask| {
+            out.reserve(W);
+            let len = out.len();
+            // SAFETY: room for W points was reserved; [u32; 2] and u64 share layout.
+            unsafe {
+                let n = compress_store(&block.points, mask, out.as_mut_ptr().add(len).cast());
+                out.set_len(len + n);
+            }
+        });
+    }
+
+    pub fn query_ids(&mut self, center: [u32; 2], radius2: u128, out: &mut Vec<usize>) {
+        self.scan(center, radius2, |block, mask| {
+            for i in 0..W {
+                if mask >> i & 1 == 1 { out.push(block.ids[i] as usize); }
+            }
+        });
+    }
+}
 
 fn contains(point: [u32; 2], center: [u32; 2], radius2: u128) -> bool {
     let dx = (point[0] as i64 - center[0] as i64).unsigned_abs() as u128;
