@@ -1,0 +1,6 @@
+[package]
+name = "mortonplus"
+version = "0.1.0"
+edition = "2021"
+description = "Morton-order disk reporting with SPRK-style query techniques (exact u32 coordinates)"
+license = "MIT"
