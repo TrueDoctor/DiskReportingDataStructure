@@ -1,6 +1,7 @@
 //! Local exact-integer reporting adapter around the upstream f32 SIMD query.
 //! Candidate IDs use the native writer. Gathering, exact membership and writing
 //! the requested output are all performed by the timed caller.
+use crate::output::IdDist;
 use crate::scalar::IdStorage;
 use crate::simd::{CompressDispatch, LaneCount, PDVec, SupportedLaneCount};
 use crate::tree::Sprk;
@@ -129,9 +130,68 @@ where
     }
 }
 
+/// f64 variant: uint32 coordinates are exact in f64, so the upstream query with a
+/// slightly widened radius is a superset, and the returned squared distance decides
+/// most points. Only candidates within 8 eps of the boundary need the exact test.
+/// Points are stored in leaf order, as in [`LeafOrderSprk`].
+pub struct ExactF64Sprk {
+    tree: Option<Sprk<2, W, f64, u32>>,
+    points: Vec<[u32; 2]>,
+    input_ids: Vec<usize>,
+    candidates: Vec<IdDist<u32, f64>>,
+}
+
+impl ExactF64Sprk {
+    pub fn new(points: &[[u32; 2]]) -> Self {
+        if points.is_empty() {
+            return Self { tree: None, points: Vec::new(), input_ids: Vec::new(), candidates: Vec::new() };
+        }
+        let coords: Vec<_> = points.iter().map(|p| p.map(f64::from)).collect();
+        let mut tree = Sprk::new(&coords);
+        let mut sorted = Vec::with_capacity(points.len());
+        let mut input_ids = Vec::with_capacity(points.len());
+        for pdvec in &mut tree.positions_sorted {
+            for id in &mut pdvec.ids {
+                if *id == u32::SENTINEL { continue; }
+                sorted.push(points[*id as usize]);
+                input_ids.push(*id as usize);
+                *id = (sorted.len() - 1) as u32;
+            }
+        }
+        Self { tree: Some(tree), points: sorted, input_ids, candidates: Vec::new() }
+    }
+
+    /// Coordinates and their differences are exact; the computed squared distance has
+    /// relative error below 3 eps. Search 8 eps outward; accept below 8 eps inward.
+    fn query(&mut self, center: [u32; 2], radius2: u128, mut accept: impl FnMut(usize, [u32; 2])) {
+        let Some(tree) = &self.tree else { return };
+        let r2 = radius2 as f64;
+        let radius = (r2 * (1.0 + 8.0 * f64::EPSILON)).sqrt() * (1.0 + 4.0 * f64::EPSILON);
+        let inside = r2 * (1.0 - 8.0 * f64::EPSILON);
+        self.candidates.clear();
+        tree.query_radius(&center.map(f64::from), radius, &mut self.candidates);
+        for c in &self.candidates {
+            let point = self.points[c.id as usize];
+            if c.dist <= inside || contains(point, center, radius2) {
+                accept(c.id as usize, point);
+            }
+        }
+    }
+
+    pub fn query_points(&mut self, center: [u32; 2], radius2: u128, out: &mut Vec<[u32; 2]>) {
+        self.query(center, radius2, |_, point| out.push(point));
+    }
+
+    pub fn query_ids(&mut self, center: [u32; 2], radius2: u128, out: &mut Vec<usize>) {
+        let input_ids = std::mem::take(&mut self.input_ids);
+        self.query(center, radius2, |id, _| out.push(input_ids[id]));
+        self.input_ids = input_ids;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{contains, IntegerPointSprk, LeafOrderSprk};
+    use super::{contains, ExactF64Sprk, IntegerPointSprk, LeafOrderSprk};
 
     trait Reporter {
         fn build(points: &[[u32; 2]]) -> Self;
@@ -150,6 +210,7 @@ mod tests {
     reporter!(IntegerPointSprk);
     reporter!(LeafOrderSprk);
     reporter!(LeafOrderSprk<4>);
+    reporter!(ExactF64Sprk);
 
     struct Rng(u64);
     impl Rng {
@@ -165,6 +226,7 @@ mod tests {
         check_with::<IntegerPointSprk>(&points, rng);
         check_with::<LeafOrderSprk>(&points, rng);
         check_with::<LeafOrderSprk<4>>(&points, rng);
+        check_with::<ExactF64Sprk>(&points, rng);
     }
 
     fn check_with<R: Reporter>(points: &[[u32; 2]], rng: &mut Rng) {
